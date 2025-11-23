@@ -1,0 +1,406 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import os
+import json
+import sqlite3
+from datetime import datetime
+import PyPDF2
+import docx
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from werkzeug.utils import secure_filename
+
+# Download NLTK data
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['ALLOWED_EXTENSIONS'] = {'pdf', 'docx', 'txt'}
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+class DrizzleblueTutor:
+    def __init__(self):
+        self.init_database()
+        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+        self.document_vectors = None
+        self.document_texts = []
+        
+    def init_database(self):
+        conn = sqlite3.connect('drizzleblue_tutor.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                content TEXT NOT NULL,
+                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS flashcards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                category TEXT,
+                FOREIGN KEY (document_id) REFERENCES documents (id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS quizzes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL,
+                correct_answer TEXT NOT NULL,
+                question_type TEXT,
+                FOREIGN KEY (document_id) REFERENCES documents (id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+
+    def allowed_file(self, filename):
+        return '.' in filename and \
+               filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+    def extract_text_from_pdf(self, file_path):
+        text = ""
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+        return text
+
+    def extract_text_from_docx(self, file_path):
+        doc = docx.Document(file_path)
+        text = ""
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        return text
+
+    def process_document(self, file_path, filename):
+        file_ext = filename.rsplit('.', 1)[1].lower()
+        
+        if file_ext == 'pdf':
+            text = self.extract_text_from_pdf(file_path)
+        elif file_ext == 'docx':
+            text = self.extract_text_from_docx(file_path)
+        elif file_ext == 'txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        else:
+            return None
+        
+        # Store in database
+        conn = sqlite3.connect('drizzleblue_tutor.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO documents (filename, content) VALUES (?, ?)",
+            (filename, text)
+        )
+        doc_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        # Update TF-IDF vectors
+        self.document_texts.append(text)
+        if len(self.document_texts) > 1:
+            self.document_vectors = self.vectorizer.fit_transform(self.document_texts)
+        else:
+            self.document_vectors = self.vectorizer.fit_transform([text])
+        
+        return {"doc_id": doc_id, "text": text, "filename": filename}
+
+    def generate_summary(self, text):
+        sentences = sent_tokenize(text)
+        summary_sentences = sentences[:3]
+        word_count = len(word_tokenize(text))
+        sentence_count = len(sentences)
+        
+        words = [word.lower() for word in word_tokenize(text) if word.isalpha()]
+        stop_words = set(stopwords.words('english'))
+        filtered_words = [word for word in words if word not in stop_words]
+        
+        from collections import Counter
+        key_terms = [word for word, count in Counter(filtered_words).most_common(10)]
+        
+        return {
+            "summary": " ".join(summary_sentences),
+            "key_terms": key_terms,
+            "statistics": {
+                "word_count": word_count,
+                "sentence_count": sentence_count,
+                "estimated_reading_time": f"{word_count/200:.1f} minutes"
+            }
+        }
+
+    def generate_flashcards(self, text, doc_id, num_cards=10):
+        sentences = sent_tokenize(text)
+        flashcards = []
+        
+        conn = sqlite3.connect('drizzleblue_tutor.db')
+        cursor = conn.cursor()
+        
+        for i, sentence in enumerate(sentences[:num_cards]):
+            words = word_tokenize(sentence)
+            content_words = [word for word in words if word.lower() not in stopwords.words('english') and word.isalpha()]
+            
+            if len(content_words) > 2:
+                question = f"What is the definition or context of '{content_words[0]}'?"
+                answer = sentence
+                
+                flashcards.append({
+                    "id": len(flashcards) + 1,
+                    "question": question,
+                    "answer": answer,
+                    "category": "Key Concepts"
+                })
+                
+                cursor.execute(
+                    "INSERT INTO flashcards (document_id, question, answer, category) VALUES (?, ?, ?, ?)",
+                    (doc_id, question, answer, "Key Concepts")
+                )
+        
+        conn.commit()
+        conn.close()
+        return flashcards
+
+    def generate_quiz(self, text, doc_id, num_questions=5):
+        sentences = [s for s in sent_tokenize(text) if len(s) > 20]
+        quiz_questions = []
+        
+        conn = sqlite3.connect('drizzleblue_tutor.db')
+        cursor = conn.cursor()
+        
+        for i, sentence in enumerate(sentences[:num_questions]):
+            words = word_tokenize(sentence)
+            content_words = [word for word in words if word.isalpha() and word.lower() not in stopwords.words('english')]
+            
+            if len(content_words) >= 4:
+                question_word = content_words[0]
+                question = f"What is the context of '{question_word}' in the document?"
+                
+                options = [
+                    sentence,
+                    "This term is not discussed",
+                    "It refers to a different concept",
+                    "The context is unclear"
+                ]
+                
+                correct_answer = sentence
+                
+                quiz_questions.append({
+                    "id": len(quiz_questions) + 1,
+                    "question": question,
+                    "options": options,
+                    "correct_answer": correct_answer,
+                    "question_type": "multiple_choice"
+                })
+                
+                cursor.execute(
+                    "INSERT INTO quizzes (document_id, question, options, correct_answer, question_type) VALUES (?, ?, ?, ?, ?)",
+                    (doc_id, question, json.dumps(options), correct_answer, "multiple_choice")
+                )
+        
+        conn.commit()
+        conn.close()
+        return quiz_questions
+
+    def ask_tutor(self, question, doc_id=None):
+        if doc_id:
+            conn = sqlite3.connect('drizzleblue_tutor.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT content FROM documents WHERE id = ?", (doc_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                document_content = result[0]
+                answer = self.find_relevant_answer(question, document_content)
+                return {
+                    "answer": answer,
+                    "source": "document_content",
+                    "confidence": "high"
+                }
+        
+        general_answer = self.general_knowledge_answer(question)
+        return {
+            "answer": general_answer,
+            "source": "general_knowledge",
+            "confidence": "medium"
+        }
+
+    def find_relevant_answer(self, question, content):
+        sentences = sent_tokenize(content)
+        
+        if len(sentences) == 0:
+            return self.general_knowledge_answer(question)
+            
+        all_texts = sentences + [question]
+        tfidf_matrix = self.vectorizer.fit_transform(all_texts)
+        
+        question_vector = tfidf_matrix[-1]
+        sentence_vectors = tfidf_matrix[:-1]
+        
+        if sentence_vectors.shape[0] > 0:
+            similarities = cosine_similarity(question_vector, sentence_vectors)
+            most_similar_idx = np.argmax(similarities)
+            
+            if similarities[0][most_similar_idx] > 0.1:
+                return sentences[most_similar_idx]
+        
+        return "I couldn't find a specific answer in your documents. " + self.general_knowledge_answer(question)
+
+    def general_knowledge_answer(self, question):
+        question_lower = question.lower()
+        
+        if "what is" in question_lower:
+            return "Based on general knowledge, this appears to be a fundamental concept. I recommend checking your study materials for specific definitions and examples."
+        elif "how does" in question_lower or "how do" in question_lower:
+            return "This process typically involves several steps as covered in educational materials. The exact procedure may vary based on context."
+        elif "why is" in question_lower:
+            return "This concept is important because it forms a foundation for understanding broader principles in the subject area."
+        elif "example" in question_lower or "example of" in question_lower:
+            return "Common examples include practical applications found in textbooks and real-world scenarios. Specific examples would depend on the context."
+        else:
+            return "That's an interesting question. While I don't have a specific answer from your uploaded materials, this topic is often covered in educational resources. Consider consulting your textbooks or course materials for detailed information."
+
+# Initialize Drizzleblue Tutor
+drizzleblue_tutor = DrizzleblueTutor()
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Drizzleblue Tutor API is running!",
+        "version": "1.0",
+        "endpoints": {
+            "upload": "/api/upload (POST)",
+            "ask_tutor": "/api/ask (POST)", 
+            "chat": "/api/chat (POST)",
+            "documents": "/api/documents (GET)",
+            "health": "/api/health (GET)"
+        },
+        "status": "active"
+    })
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "service": "Drizzleblue Tutor", "timestamp": datetime.now().isoformat()})
+
+@app.route('/api/upload', methods=['POST'])
+def upload_document():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    
+    if file and drizzleblue_tutor.allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        try:
+            result = drizzleblue_tutor.process_document(file_path, filename)
+            if not result:
+                return jsonify({"error": "Error processing document"}), 500
+            
+            summary = drizzleblue_tutor.generate_summary(result["text"])
+            flashcards = drizzleblue_tutor.generate_flashcards(result["text"], result["doc_id"])
+            quiz = drizzleblue_tutor.generate_quiz(result["text"], result["doc_id"])
+            
+            os.remove(file_path)
+            
+            return jsonify({
+                "success": True,
+                "document_id": result["doc_id"],
+                "filename": result["filename"],
+                "summary": summary,
+                "flashcards": flashcards,
+                "quiz": quiz,
+                "message": f"Drizzleblue Tutor generated {len(flashcards)} flashcards and {len(quiz)} quiz questions"
+            })
+            
+        except Exception as e:
+            return jsonify({"error": f"Processing error: {str(e)}"}), 500
+    
+    return jsonify({"error": "Invalid file type. Please upload PDF, DOCX, or TXT"}), 400
+
+@app.route('/api/ask', methods=['POST'])
+def ask_tutor():
+    data = request.get_json()
+    
+    if not data or 'question' not in data:
+        return jsonify({"error": "No question provided"}), 400
+    
+    question = data['question']
+    document_id = data.get('document_id')
+    
+    try:
+        response = drizzleblue_tutor.ask_tutor(question, document_id)
+        return jsonify({
+            "success": True,
+            "question": question,
+            "response": response
+        })
+    except Exception as e:
+        return jsonify({"error": f"Tutor error: {str(e)}"}), 500
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    data = request.get_json()
+    
+    if not data or 'message' not in data:
+        return jsonify({"error": "No message provided"}), 400
+    
+    message = data['message']
+    document_id = data.get('document_id')
+    
+    try:
+        response = drizzleblue_tutor.ask_tutor(message, document_id)
+        return jsonify({
+            "success": True,
+            "message": message,
+            "response": response['answer'],
+            "source": response['source']
+        })
+    except Exception as e:
+        return jsonify({"error": f"Chat error: {str(e)}"}), 500
+
+@app.route('/api/documents', methods=['GET'])
+def list_documents():
+    conn = sqlite3.connect('drizzleblue_tutor.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, filename, upload_date FROM documents ORDER BY upload_date DESC")
+    documents = cursor.fetchall()
+    conn.close()
+    
+    result = []
+    for doc in documents:
+        result.append({
+            "id": doc[0],
+            "filename": doc[1],
+            "upload_date": doc[2]
+        })
+    
+    return jsonify({"documents": result})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
